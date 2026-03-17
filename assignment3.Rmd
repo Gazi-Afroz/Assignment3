@@ -1,0 +1,664 @@
+---
+title: "Assignment 3 – Spatial prediction and validation tutorial"
+author: "Wilfrid Laurier University"
+date: "February 25, 2025"
+output: html_document
+---
+
+# GG501A - Spatial Knowledge Mobilization
+
+## Packages and data import
+
+```{r}
+# ATTACH PACKAGES AND IMPORT DATA ############################################
+
+# attach packages
+library("terra") # handling gridded datasets
+library("mgcv") # generalized additive model
+library("sperrorest") # For performing model validation
+
+# specify a working directory (data is stored)
+setwd("/Users/jalam/Library/CloudStorage/OneDrive-arsanalytics.com/Shaila/GG501/Assignment3/GG501_Assign3_Data 2")
+
+# import grid of landslide (polygon) areas
+landslides <- rast('slides89.asc')
+
+# import hillshade model for visualization
+hillshade <- rast('hillshade.tif')
+
+# import the environmental factors (i.e. predictor variables)
+elev <- rast('elev.asc')                  # elevation
+profc <- rast('profcurv.asc')             # profile curvature
+planc <- rast('plancurv.asc')             # plan curvature
+distdeforest <- rast('distdeforest.asc')  # distance to deforested areas
+distroad <- rast('distroad.asc')          # distance to roads
+
+# the grid data values for hillslope angle need to be transfomred from radians to degrees
+slope <- rast('slope.asc')*180/pi
+names(slope) <- "slope"
+
+# log transform (with base 10) of upslope contributing
+logcarea <- log10(rast('carea.asc'))
+names(logcarea) <- "logcarea"
+
+# reclassify distances over 300 to just 300 for dist from deforest
+rclmatrix <- matrix(c(300, Inf, 300), ncol = 3, byrow = TRUE)
+distdeforest <- classify(distdeforest, rclmatrix)
+names(distdeforest) <- "distdeforest"
+
+# use the same classification for dist from roads
+distroad <- classify(distroad, rclmatrix)
+names(distroad) <- "distroad"
+
+# build a RasterStack object - a collection of RasterLayer objects with same
+# spatial extent and resolution
+layers <- c(slope, elev, profc, planc, distdeforest,
+            distroad, logcarea)
+# visualize gridded data
+plot(layers)
+
+# import mask of study area boundary
+studymask <- rast('mask.asc')
+plot(studymask)
+
+# Unlike geotiff's and other raster data formats, the ascii file format does 
+# hold coordinate reference system (CRS) so we need to define it
+crs(landslides) <- crs('+init=EPSG:32717')
+crs(layers) <- crs('+init=EPSG:32717')
+crs(studymask) <- crs('+init=EPSG:32717')
+```
+
+## Spatial sample of landslide and non‑landslide areas
+
+```{r}
+# SPATIAL SAMPLE OF LANDSLIDE AND NON-LANDSLIDE AREAS ########################
+
+# To provide data for our spatially predictive models we need to create
+# sample of the response variable: landslide and non-landslides
+
+# set the seed of R's random number generator to reproduce the random samples
+# if the script is run at a later time
+set.seed(1234)
+
+# first, we randomly sample cell locations within landslides
+smp.slides <- as.data.frame(spatSample(landslides, size = 1000, xy = TRUE, exhaustive = TRUE, na.rm=TRUE))
+smp.slides[,3] = NULL #remove the raster value column
+plot(landslides)
+points(smp.slides)
+
+# now, we randomly sample non-landslide areas but first we need to
+# mask out landslide areas
+studymask <- mask(studymask, landslides, inverse = TRUE)
+plot(studymask)
+
+# randomly sample cell locations of non-landslide cells
+smp.noslides <- as.data.frame(spatSample(studymask, size = 1000, xy = TRUE, na.rm=TRUE))
+smp.noslides[,3] = NULL
+points(smp.noslides)
+
+# extract predictor variable values from grids
+# for the landslide samples
+df.slides <- extract(layers, smp.slides, sp = TRUE)
+df.slides <- as.data.frame(df.slides)
+# add xy values
+df.slides$x <- smp.slides$x
+df.slides$y <- smp.slides$y
+# add variable indicating that these are landslides
+df.slides$landslide <- "TRUE"
+
+# for the non-landslide sample
+df.noslides <- as.data.frame(extract(layers, smp.noslides, sp = TRUE))
+df.noslides$x <- smp.noslides$x
+df.noslides$y <- smp.noslides$y
+df.noslides$landslide <- "FALSE"
+
+# combine the slides and no slides data into one dataframe
+ecuador <- rbind(df.slides, df.noslides)
+
+# encode the landslide variable as a factor
+ecuador$landslide <- as.factor(ecuador$landslide)
+```
+
+## Build landslide susceptibility models
+
+```{r}
+# BUILD LANDSLIDE SUSCEPTIBILITY MODELS ######################################
+
+# in this section we are fitting two statistical models, logistic regression (linear)
+# and a generalized additive model (nonlinear)
+
+# first define the formula with the response variable (landslide & non-landslides)
+# and predictor variables (terrain attributes and distance to road & forest)
+
+## Logistic regression ####
+fml.lr <- landslide ~ elev + slope + profcurv + plancurv + logcarea +
+  distroad + distdeforest
+
+model.lr <- glm(formula = fml.lr, family = 'binomial', data = ecuador)
+summary(model.lr)
+
+# https://stats.oarc.ucla.edu/r/dae/logit-regression/
+# ^ How to interpret logistic regression (log-odds)
+
+## Generalized additive model ####
+
+#Define the formula for the GAM
+# k defines the 1 - the degrees of freedom for spline, which controls
+# the restrictiveness or generalization of the model. Higher effective DF means
+# less restrictive less general, lower effective DF mean more generalization.
+
+fml.gam <- landslide ~ s(elev, k = 4) + s(slope, k = 4) + s(profcurv, k = 4) + 
+  s(plancurv, k = 4) + s(logcarea, k = 4) + s(distroad, k = 4) + 
+  s(distdeforest, k = 4)
+
+# fit a generalized additive model (GAM)
+model.gam <- gam(fml.gam, family = binomial, data = ecuador)
+
+# visualize smoothing functions in the GAM 
+par(mfrow=c(2,4))
+plot(model.gam) # MAKE NICER FOR DEMO
+
+# https://noamross.github.io/gams-in-r-course/chapter2
+# ^ How to interpret GAM results
+
+# https://r.qcbs.ca/workshop08/pres-en/workshop08-pres-en.html#43
+# ^ Understanding effective degrees of freedom (EDF; k-1) ['wiggliness']
+```
+
+## Model validation and comparison
+
+```{r}
+# MODEL VALIDATION AND COMPARISON ############################################
+
+# Perform repeated k-fold spatial (SPCV) and non-spatial cross-validation (CV)
+# e.g. 10-repeated 5-fold SPCV and CV.
+
+## Baseline logistic regression model [most generalization] ####
+lr.spcv <- sperrorest(formula = fml.lr, data = ecuador, coords = c("x","y"),
+                      model_fun = glm, 
+                      model_args = list(family = 'binomial'),
+                      pred_args = list(type="response"),
+                      smp_fun = partition_kmeans, 
+                      smp_args = list(repetition = 1:10, nfold = 5))
+
+lr.spcv.auroc.test <- unlist(summary(lr.spcv$error_rep,level=1)[,"test_auroc"])
+
+# https://developers.google.com/machine-learning/crash-course/classification/roc-and-auc
+# ^ What is area under the receiver operating characteristic curve (AUROC) and
+#   how to interpret it.
+
+lr.cv <- sperrorest(formula = fml.lr, data = ecuador,
+                    model_fun = glm, 
+                    model_args = list(family = 'binomial'),
+                    pred_args = list(type="response"),
+                    smp_fun = partition_cv, 
+                    smp_args = list(repetition = 1:10, nfold = 5))
+
+# let's get the values auroc recorded for each repetition
+lr.cv.auroc.test <- unlist(summary(lr.cv$error_rep,level=1)[,"test_auroc"])
+
+## GAM performance ####
+
+# Create empty lists to store spatial and non-spatial cross-validation results
+# for each tested max. EDF
+
+# perform 10 repeated, 5-fold spatial CV for the generalized additive model
+gam.spcv <- sperrorest(formula = fml.gam, data = ecuador, coords = c("x","y"),
+                       model_fun = gam,
+                       model_args = list(family=binomial),
+                       pred_args = list(type="response"), 
+                       smp_fun = partition_kmeans, 
+                       smp_args = list(repetition = 1:10, nfold = 5))
+
+gam_spcv.auroc.test <- unlist(summary(gam.spcv$error_rep,level=1)[,"test_auroc"])
+
+# perform 10 repeated, 5-fold (non-spatial) CV for the generalized additive model
+gam.cv <- sperrorest(formula = fml.gam, data = ecuador,
+                   model_fun = gam,
+                   model_args = list(family = binomial),
+                   pred_args = list(type = "response"),
+                   smp_fun = partition_cv,
+                   smp_args = list(repetition = 1:10, nfold = 5))
+
+gam_cv.auroc.test <- unlist(summary(gam.cv$error_rep,level=1)[,"test_auroc"])
+
+
+# Compile the results into a table (data frame)
+results_auroc <- data.frame(LR_CV = lr.cv.auroc.test, 
+                            LR_SPCV = lr.spcv.auroc.test,
+                            GAM_CV = gam_cv.auroc.test, 
+                            GAM_SPCV = gam_spcv.auroc.test)
+
+par(mfrow=c(1,1))
+
+boxplot(results_auroc, ylab = "Area under ROC") # MAKE NICER FOR DEMO
+
+
+
+# Create plots to visualize the spatial and non-spatial cross-validation
+
+### Ok great we have numbers! Where did they come from?
+
+# Resampling for non-spatial cross-validation:
+resamp.cv = partition_cv(ecuador, nfold=5, repetition=1)
+plot(resamp.cv, ecuador)
+
+
+# Resampling for spatial cross-validation using k-means:
+resamp.spcv = partition_kmeans(ecuador, nfold=5, repetition=1)
+plot(resamp.spcv, ecuador)
+
+#^MAKE NICER FOR DEMO
+```
+
+## Apply spatial predictions to gridded data
+
+```{r}
+# APPLY SPATIAL PREDICTIONS TO GRIDDED DATA ##################################
+
+# now that we have validated our model performance, we can create
+# a spatial model prediction by applying the fitted model predictions
+# to a gridded dataset (our RasterStack object)
+pred.lr <- terra::predict(layers, model.lr, type = "response", progress = TRUE)
+pred.gam <- terra::predict(layers, model.gam, type = "response", progress = TRUE)
+
+# export to a raster format
+writeRaster(pred.lr, "susc_model_lr.tif", filetype = "GTiff", overwrite = TRUE)
+writeRaster(pred.gam, "susc_model_gam.tif", filetype = "GTiff", overwrite = TRUE)
+```
+
+## Visualize results
+
+```{r}
+# VISUALIZE RESULTS ########################################################
+library(ggplot2)
+library(patchwork) # Tile multiple maps together
+library(ggnewscale) # Allow multiple scales in a map
+
+# Transform raster data into a data frame for use with ggplot
+hillshade_df <- as.data.frame(hillshade, xy = TRUE)
+hillshade_df <- hillshade_df[!is.na(hillshade_df[,3]),]
+
+pred_df <- as.data.frame(pred.gam, xy = TRUE)
+pred_df <- pred_df[!is.na(pred_df[,3]),]
+names(pred_df) <- c("x", "y", "pred")
+
+# Create source area prediction map
+map.pred <- ggplot() +
+  geom_tile(data=hillshade_df, aes(x=x, y=y, fill = hillshade),
+            show.legend = FALSE) +
+  scale_fill_gradient(high = "white", low = "black", na.value = "#FFFFFF") +
+  new_scale("fill") +
+  geom_tile(data=pred_df, aes(x=x, y=y, fill = pred) ) +
+  scale_fill_viridis_c(name = "Landslide\nSusceptibility\nIndex",  alpha = 0.6, direction = -1) +
+  xlab("Easting (m)") +
+  ylab("Northing (m)") +
+  geom_point(data = smp.slides, aes(x = x, y = y), size = 1, shape = 21, fill = "black", alpha = 0.4) +
+  coord_fixed() +
+  theme_light() +
+  theme(text = element_text(size = 9), axis.title = element_text(size = 9),
+        axis.text = element_text(size = 6), axis.text.y = element_text(angle = 90))
+map.pred
+```
+
+## Assignment-related code – summary table of predictor characteristics
+
+```{r}
+# TABLE OF PREDICTOR CHARACTERISTICS 
+
+# cleaner summary table
+summary_table <- data.frame(
+  Variable = c("elev", "slope", "profcurv", "plancurv", "logcarea", "distroad", "distdeforest"),
+  Mean_Landslide = c(
+    mean(df.slides$elev, na.rm = TRUE),
+    mean(df.slides$slope, na.rm = TRUE),
+    mean(df.slides$profcurv, na.rm = TRUE),
+    mean(df.slides$plancurv, na.rm = TRUE),
+    mean(df.slides$logcarea, na.rm = TRUE),
+    mean(df.slides$distroad, na.rm = TRUE),
+    mean(df.slides$distdeforest, na.rm = TRUE)
+  ),
+  SD_Landslide = c(
+    sd(df.slides$elev, na.rm = TRUE),
+    sd(df.slides$slope, na.rm = TRUE),
+    sd(df.slides$profcurv, na.rm = TRUE),
+    sd(df.slides$plancurv, na.rm = TRUE),
+    sd(df.slides$logcarea, na.rm = TRUE),
+    sd(df.slides$distroad, na.rm = TRUE),
+    sd(df.slides$distdeforest, na.rm = TRUE)
+  ),
+  Mean_Nonlandslide = c(
+    mean(df.noslides$elev, na.rm = TRUE),
+    mean(df.noslides$slope, na.rm = TRUE),
+    mean(df.noslides$profcurv, na.rm = TRUE),
+    mean(df.noslides$plancurv, na.rm = TRUE),
+    mean(df.noslides$logcarea, na.rm = TRUE),
+    mean(df.noslides$distroad, na.rm = TRUE),
+    mean(df.noslides$distdeforest, na.rm = TRUE)
+  ),
+  SD_Nonlandslide = c(
+    sd(df.noslides$elev, na.rm = TRUE),
+    sd(df.noslides$slope, na.rm = TRUE),
+    sd(df.noslides$profcurv, na.rm = TRUE),
+    sd(df.noslides$plancurv, na.rm = TRUE),
+    sd(df.noslides$logcarea, na.rm = TRUE),
+    sd(df.noslides$distroad, na.rm = TRUE),
+    sd(df.noslides$distdeforest, na.rm = TRUE)
+  )
+)
+
+summary_table
+
+
+
+summary_table[ , -1] <- round(summary_table[ , -1], 3)
+
+
+sink("summary_table.tex")
+cat("\\begin{table}[H]\n")
+cat("\\centering\n")
+cat("\\caption{Summary statistics for predictor variables.}\n")
+cat("\\label{tab:summary_stats}\n")
+cat("\\begin{tabular}{lcccc}\n")
+cat("\\toprule\n")
+cat("Variable & Mean (Landslide) & SD (Landslide) & Mean (Non-landslide) & SD (Non-landslide) \\\\n")
+cat("\\midrule\n")
+
+for (i in 1:nrow(summary_table)) {
+  cat(
+    summary_table$Variable[i], " & ",
+    sprintf("%.3f", summary_table$Mean_Landslide[i]), " & ",
+    sprintf("%.3f", summary_table$SD_Landslide[i]), " & ",
+    sprintf("%.3f", summary_table$Mean_Nonlandslide[i]), " & ",
+    sprintf("%.3f", summary_table$SD_Nonlandslide[i]), " \\\\n",
+    sep = ""
+  )
+}
+
+cat("\\bottomrule\n")
+cat("\\end{tabular}\n")
+cat("\\end{table}\n")
+sink()
+```
+
+## Random forest model
+
+```{r}
+# RANDOM FOREST MODEL ########################################################
+
+#install.packages("randomForest")   
+library(randomForest)
+
+fml.rf <- landslide ~ elev + slope + profcurv + plancurv + logcarea +
+  distroad + distdeforest
+
+model.rf <- randomForest(
+  formula = fml.rf,
+  data = ecuador,
+  ntree = 500,
+  importance = TRUE
+)
+
+print(model.rf)
+importance(model.rf)
+
+
+# get variable importance
+rf_importance <- as.data.frame(importance(model.rf))
+rf_importance$Variable <- rownames(rf_importance)
+rf_importance <- rf_importance[, c("Variable", setdiff(names(rf_importance), "Variable"))]
+rf_importance[, -1] <- round(rf_importance[, -1], 3)
+
+
+sink("rf_importance_table.tex")
+cat("\\begin{table}[H]\n")
+cat("\\centering\n")
+cat("\\caption{Random Forest variable importance.}\n")
+cat("\\label{tab:rf_importance}\n")
+cat("\\begin{tabular}{l", paste(rep("c", ncol(rf_importance) - 1), collapse = ""), "}\n", sep = "")
+cat("\\toprule\n")
+cat(paste(names(rf_importance), collapse = " & "), "\\\\\n")
+cat("\\midrule\n")
+
+for (i in 1:nrow(rf_importance)) {
+  row_vals <- c(
+    rf_importance$Variable[i],
+    sapply(rf_importance[i, -1], function(x) sprintf("%.3f", as.numeric(x)))
+  )
+  cat(paste(row_vals, collapse = " & "), "\\\\\n")
+}
+
+cat("\\bottomrule\n")
+cat("\\end{tabular}\n")
+cat("\\end{table}\n")
+sink()
+```
+
+## Random forest variable importance plot
+
+```{r}
+# RANDOM FOREST VARIABLE IMPORTANCE PLOT 
+
+par(mar = c(5, 8, 0.5, 2))
+varImpPlot(
+  model.rf,
+  main = "",
+  pch = 16,
+  cex = 0.8
+)
+
+pdf("rf_variable_importance.pdf", width = 8, height = 6)
+
+par(mar = c(5, 8, 0.5, 2))
+varImpPlot(
+  model.rf,
+  main = "",
+  pch = 16,
+  cex = 0.8
+)
+
+dev.off()
+```
+
+## GAM smooth plots
+
+```{r}
+# GAM SMOOTH PLOTS 
+
+par(mfrow = c(2, 4), mar = c(4, 4, 1, 1))
+plot(model.gam, shade = TRUE, seWithMean = TRUE)
+
+pdf("gam_smooth_plots.pdf", width = 12, height = 6)
+
+par(mfrow = c(2, 4), mar = c(4, 4, 1, 1))
+plot(model.gam, shade = TRUE, seWithMean = TRUE)
+
+dev.off()
+```
+
+## Random forest validation
+
+```{r}
+# RANDOM FOREST VALIDATION 
+
+rf_pred <- function(object, newdata) {
+  predict(object, newdata = newdata, type = "prob")[, "TRUE"]
+}
+
+rf.spcv <- sperrorest(
+  formula = fml.rf,
+  data = ecuador,
+  coords = c("x", "y"),
+  model_fun = randomForest,
+  model_args = list(ntree = 500, importance = TRUE),
+  pred_fun = rf_pred,
+  smp_fun = partition_kmeans,
+  smp_args = list(repetition = 1:10, nfold = 5)
+)
+rf.spcv.auroc.test <- unlist(summary(rf.spcv$error_rep, level = 1)[, "test_auroc"])
+
+rf.cv <- sperrorest(
+  formula = fml.rf,
+  data = ecuador,
+  model_fun = randomForest,
+  model_args = list(ntree = 500, importance = TRUE),
+  pred_fun = rf_pred,
+  smp_fun = partition_cv,
+  smp_args = list(repetition = 1:10, nfold = 5)
+)
+
+
+rf.cv.auroc.test   <- unlist(summary(rf.cv$error_rep, level = 1)[, "test_auroc"])
+
+
+
+# MODEL PERFORMANCE BOXPLOT 
+
+results_auroc <- data.frame(
+  RF_CV = rf.cv.auroc.test,
+  RF_SPCV = rf.spcv.auroc.test,
+  GAM_CV = gam_cv.auroc.test,
+  GAM_SPCV = gam_spcv.auroc.test
+)
+
+par(mfrow = c(1, 1), mar = c(5, 5, 1.5, 1))
+
+boxplot(
+  results_auroc,
+  names = c("RF (CV)", "RF (SPCV)", "GAM (CV)", "GAM (SPCV)"),
+  ylab = "Area Under ROC Curve (AUROC)",
+  col = c("grey85", "grey70", "grey85", "grey70"),
+  border = "black",
+  medlwd = 2,
+  boxwex = 0.55,
+  outline = FALSE,
+  las = 1,
+  cex.axis = 1.05,
+  cex.lab = 1.1
+)
+
+
+
+pdf("model_performance_boxplot.pdf", width = 8, height = 6)
+
+par(mfrow = c(1, 1), mar = c(5, 5, 1.5, 1))
+
+boxplot(
+  results_auroc,
+  names = c("RF (CV)", "RF (SPCV)", "GAM (CV)", "GAM (SPCV)"),
+  ylab = "Area Under ROC Curve (AUROC)",
+  col = c("grey85", "grey70", "grey85", "grey70"),
+  border = "black",
+  medlwd = 2,
+  boxwex = 0.55,
+  outline = FALSE,
+  las = 1,
+  cex.axis = 1.05,
+  cex.lab = 1.1
+)
+
+dev.off()
+
+
+# CV VS SPATIAL CV SAMPLING PLOT 
+
+resamp.cv <- partition_cv(ecuador, nfold = 5, repetition = 1)
+resamp.spcv <- partition_kmeans(ecuador, nfold = 5, repetition = 1)
+
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 1))
+
+par(mar = c(4, 4, 1, 1))
+plot(resamp.cv, ecuador)
+
+pdf("nonspatial_cv_sampling.pdf", width = 5, height = 5)
+par(mar = c(4, 4, 1, 1))
+plot(resamp.cv, ecuador)
+dev.off()
+
+par(mar = c(4, 4, 1, 1))
+plot(resamp.spcv, ecuador)
+
+pdf("spatial_cv_sampling.pdf", width = 5, height = 5)
+par(mar = c(4, 4, 1, 1))
+plot(resamp.spcv, ecuador)
+dev.off()
+```
+
+## Spatial predictions
+
+```{r}
+# SPATIAL PREDICTIONS 
+
+pred.rf <- terra::predict(layers, model.rf, type = "prob", index = 2, progress = TRUE)
+pred.gam <- terra::predict(layers, model.gam, type = "response", progress = TRUE)
+
+writeRaster(pred.rf, "susc_model_rf.tif", filetype = "GTiff", overwrite = TRUE)
+writeRaster(pred.gam, "susc_model_gam.tif", filetype = "GTiff", overwrite = TRUE)
+```
+
+## Maps comparing RF and GAM
+
+```{r}
+# MAPS COMPARING RF AND GAM 
+
+library(ggplot2)
+library(ggnewscale)
+library(patchwork)
+
+hillshade_df <- as.data.frame(hillshade, xy = TRUE)
+hillshade_df <- hillshade_df[!is.na(hillshade_df[, 3]), ]
+names(hillshade_df) <- c("x", "y", "hillshade")
+
+pred_rf_df <- as.data.frame(pred.rf, xy = TRUE)
+pred_rf_df <- pred_rf_df[!is.na(pred_rf_df[, 3]), ]
+names(pred_rf_df) <- c("x", "y", "pred")
+
+pred_gam_df <- as.data.frame(pred.gam, xy = TRUE)
+pred_gam_df <- pred_gam_df[!is.na(pred_gam_df[, 3]), ]
+names(pred_gam_df) <- c("x", "y", "pred")
+
+
+## Random Forest map
+map.rf <- ggplot() +
+  geom_tile(data = hillshade_df, aes(x = x, y = y, fill = hillshade),
+            show.legend = FALSE) +
+  scale_fill_gradient(high = "white", low = "black", na.value = "#FFFFFF") +
+  new_scale("fill") +
+  geom_tile(data = pred_rf_df, aes(x = x, y = y, fill = pred), alpha = 0.6) +
+  scale_fill_viridis_c(name = "RF\nSusceptibility", direction = -1) +
+  geom_point(data = smp.slides, aes(x = x, y = y),
+             size = 0.8, shape = 21, fill = "black", alpha = 0.35) +
+  xlab("Easting (m)") +
+  ylab("Northing (m)") +
+  coord_fixed() +
+  theme_light() +
+  ggtitle("Random Forest")
+
+map.rf
+
+pdf("map_rf.pdf", width = 8, height = 6)
+print(map.rf)
+dev.off()
+
+#GAM map
+map.gam <- ggplot() +
+  geom_tile(data = hillshade_df, aes(x = x, y = y, fill = hillshade),
+            show.legend = FALSE) +
+  scale_fill_gradient(high = "white", low = "black", na.value = "#FFFFFF") +
+  new_scale("fill") +
+  geom_tile(data = pred_gam_df, aes(x = x, y = y, fill = pred), alpha = 0.6) +
+  scale_fill_viridis_c(name = "GAM\nSusceptibility", direction = -1) +
+  geom_point(data = smp.slides, aes(x = x, y = y),
+             size = 0.8, shape = 21, fill = "black", alpha = 0.35) +
+  xlab("Easting (m)") +
+  ylab("Northing (m)") +
+  coord_fixed() +
+  theme_light() +
+  ggtitle("Generalized Additive Model")
+
+map.gam
+
+pdf("map_gam.pdf", width = 8, height = 6)
+print(map.gam)
+dev.off()
+```
